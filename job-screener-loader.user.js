@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Screener (Team)
 // @namespace    https://github.com/Akashlearntogit/job_screener_AM
-// @version      1.6.0
+// @version      1.7.0
 // @updateURL    https://raw.githubusercontent.com/Akashlearntogit/job_screener_loader/main/job-screener-loader.user.js
 // @downloadURL  https://raw.githubusercontent.com/Akashlearntogit/job_screener_loader/main/job-screener-loader.user.js
 // @description  Screens job postings for your chosen client. Downloads the latest screener and client profiles from the team's private GitHub repo automatically.
@@ -16,6 +16,7 @@
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
 // @grant        GM_xmlhttpRequest
+// @grant        GM_addElement
 // @connect      api.github.com
 // @connect      script.google.com
 // @connect      script.googleusercontent.com
@@ -51,7 +52,7 @@
   // Keep @name, @namespace and @updateURL unchanged: Tampermonkey uses them to update this
   // script in place (keeping each person's key and client). After changing this file, run
   // scripts/publish-loader.sh so the public copy that Tampermonkey checks is updated too.
-  const LOADER_VERSION = '1.6';
+  const LOADER_VERSION = '1.7';
 
   const settings = () => GM_getValue(KEY.settings, {}) || {};
   // Decided from page content only (no site lists): structured JobPosting data, or text with
@@ -153,20 +154,87 @@
     }
     if (root.dataset.jobScreenerLoader) return;
     root.dataset.jobScreenerLoader = LOADER_VERSION;
+    let fn;
     try {
-      const fn = new Function('GM_addStyle', 'GM_getValue', 'GM_setValue', 'GM_registerMenuCommand', 'GM_xmlhttpRequest', 'LOADER_INFO', code);
-      fn(GM_addStyle, GM_getValue, GM_setValue, GM_registerMenuCommand, GM_xmlhttpRequest, { version: LOADER_VERSION, openSettings });
+      fn = new Function('GM_addStyle', 'GM_getValue', 'GM_setValue', 'GM_registerMenuCommand', 'GM_xmlhttpRequest', 'LOADER_INFO', code);
     } catch (e) {
-      console.error('[job-screener loader] screener failed to start', e);
-      delete root.dataset.jobScreenerLoader;
-      // Only bother the person on job pages; elsewhere stay silent.
-      if (!looksLikeJobPage()) return;
-      const blocked = /Content Security Policy|unsafe-eval|EvalError/i.test(String(e && (e.message || e)));
-      notice(blocked
-        ? "this site's security settings block the screener. Other job sites are not affected."
-        : 'the screener could not start (' + e.message + ').', true);
+      // Strict sites (e.g. metacareers.com) forbid turning text into code. Fall back to
+      // Tampermonkey's GM_addElement, which can add a script even under such a policy.
+      try { runInPage(code); return; } catch (e2) { return failed(e2); }
     }
+    try {
+      fn(GM_addStyle, GM_getValue, GM_setValue, GM_registerMenuCommand, GM_xmlhttpRequest, { version: LOADER_VERSION, openSettings });
+    } catch (e) { failed(e); }
   }
+
+  // ---------- strict-site mode: run the screener in the page, talk to it by messages ----------
+  // The screener only sees what it needs: the client profiles, the chosen client and the
+  // person's name. The GitHub access key never enters the page.
+  const PAGE_KEYS = [KEY.profiles, KEY.profilesAt, KEY.active];
+  function pageSnapshot() {
+    const snap = {};
+    for (const k of PAGE_KEYS) snap[k] = GM_getValue(k, null);
+    snap[KEY.settings] = { memberName: settings().memberName || '' };
+    return snap;
+  }
+  function runInPage(code) {
+    const channel = 'jsx-' + Math.random().toString(36).slice(2);
+    const toPage = (msg) => document.dispatchEvent(new CustomEvent(channel + '-in', { detail: JSON.stringify(msg) }));
+    document.addEventListener(channel + '-out', (e) => {
+      let m; try { m = JSON.parse(e.detail); } catch (_) { return; }
+      if (m.type === 'style') GM_addStyle(String(m.css));
+      else if (m.type === 'set' && m.key === KEY.active) GM_setValue(KEY.active, String(m.value || ''));
+      else if (m.type === 'menu') GM_registerMenuCommand(String(m.name), () => toPage({ type: 'menu', name: m.name }));
+      else if (m.type === 'openSettings') openSettings();
+    });
+    // Keep the page's copy current when the client or profiles change in this browser.
+    let last = JSON.stringify(pageSnapshot());
+    setInterval(() => {
+      const now = JSON.stringify(pageSnapshot());
+      if (now !== last) { last = now; toPage({ type: 'store', store: JSON.parse(now) }); }
+    }, 1000);
+    const wrapper = `(function () {
+  var channel = ${JSON.stringify(channel)};
+  var store = ${JSON.stringify(pageSnapshot())};
+  var menu = {};
+  function send(m) { document.dispatchEvent(new CustomEvent(channel + '-out', { detail: JSON.stringify(m) })); }
+  document.addEventListener(channel + '-in', function (e) {
+    var m; try { m = JSON.parse(e.detail); } catch (_) { return; }
+    if (m.type === 'store') { for (var k in m.store) store[k] = m.store[k]; }
+    if (m.type === 'menu' && menu[m.name]) menu[m.name]();
+  });
+  var copy = function (v) { return v == null ? v : JSON.parse(JSON.stringify(v)); };
+  (function (GM_addStyle, GM_getValue, GM_setValue, GM_registerMenuCommand, GM_xmlhttpRequest, LOADER_INFO) {
+${code}
+  })(
+    function (css) { send({ type: 'style', css: String(css) }); },
+    function (k, d) { return Object.prototype.hasOwnProperty.call(store, k) && store[k] != null ? copy(store[k]) : d; },
+    function (k, v) { store[k] = copy(v); send({ type: 'set', key: k, value: v }); },
+    function (name, fn) { menu[name] = fn; send({ type: 'menu', name: name }); },
+    function () { throw new Error('Network requests are not available in strict-site mode.'); },
+    { version: ${JSON.stringify(LOADER_VERSION)}, mode: 'page', openSettings: function () { send({ type: 'openSettings' }); } }
+  );
+})();`;
+    if (typeof GM_addElement !== 'function') throw new Error('GM_addElement is not available');
+    GM_addElement('script', { textContent: wrapper });
+    // If the page refused the script, the screener never marks itself as running.
+    setTimeout(() => {
+      if (!document.documentElement.dataset.jobScreenerRunning) failed(new Error("Content Security Policy: the site refused the screener's script"));
+    }, 1500);
+  }
+
+  function failed(e) {
+    const root = document.documentElement;
+    console.error('[job-screener loader] screener failed to start', e);
+    delete root.dataset.jobScreenerLoader;
+    // Only bother the person on job pages; elsewhere stay silent.
+    if (!looksLikeJobPage()) return;
+    const blocked = /Content Security Policy|unsafe-eval|EvalError/i.test(String(e && (e.message || e)));
+    notice(blocked
+      ? "this site's security settings block the screener. Other job sites are not affected."
+      : 'the screener could not start (' + e.message + ').', true);
+  }
+
 
   // ---------- setup box ----------
   GM_addStyle(`
