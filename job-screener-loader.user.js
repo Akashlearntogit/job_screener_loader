@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Screener (Team)
 // @namespace    https://github.com/Akashlearntogit/job_screener_AM
-// @version      1.7.0
+// @version      1.8.0
 // @updateURL    https://raw.githubusercontent.com/Akashlearntogit/job_screener_loader/main/job-screener-loader.user.js
 // @downloadURL  https://raw.githubusercontent.com/Akashlearntogit/job_screener_loader/main/job-screener-loader.user.js
 // @description  Screens job postings for your chosen client. Downloads the latest screener and client profiles from the team's private GitHub repo automatically.
@@ -52,7 +52,7 @@
   // Keep @name, @namespace and @updateURL unchanged: Tampermonkey uses them to update this
   // script in place (keeping each person's key and client). After changing this file, run
   // scripts/publish-loader.sh so the public copy that Tampermonkey checks is updated too.
-  const LOADER_VERSION = '1.7';
+  const LOADER_VERSION = '1.8';
 
   const settings = () => GM_getValue(KEY.settings, {}) || {};
   // Decided from page content only (no site lists): structured JobPosting data, or text with
@@ -186,6 +186,7 @@
       else if (m.type === 'set' && m.key === KEY.active) GM_setValue(KEY.active, String(m.value || ''));
       else if (m.type === 'menu') GM_registerMenuCommand(String(m.name), () => toPage({ type: 'menu', name: m.name }));
       else if (m.type === 'openSettings') openSettings();
+      else if (m.type === 'request') relayRequest(m, toPage);
     });
     // Keep the page's copy current when the client or profiles change in this browser.
     let last = JSON.stringify(pageSnapshot());
@@ -202,7 +203,14 @@
     var m; try { m = JSON.parse(e.detail); } catch (_) { return; }
     if (m.type === 'store') { for (var k in m.store) store[k] = m.store[k]; }
     if (m.type === 'menu' && menu[m.name]) menu[m.name]();
+    if (m.type === 'response' && pending[m.id]) {
+      var o = pending[m.id]; delete pending[m.id];
+      if (m.event === 'load' && o.onload) o.onload({ status: m.status, responseText: m.responseText });
+      else if (m.event === 'timeout' && o.ontimeout) o.ontimeout();
+      else if (o.onerror) o.onerror();
+    }
   });
+  var pending = {}, nextId = 1;
   var copy = function (v) { return v == null ? v : JSON.parse(JSON.stringify(v)); };
   (function (GM_addStyle, GM_getValue, GM_setValue, GM_registerMenuCommand, GM_xmlhttpRequest, LOADER_INFO) {
 ${code}
@@ -211,7 +219,10 @@ ${code}
     function (k, d) { return Object.prototype.hasOwnProperty.call(store, k) && store[k] != null ? copy(store[k]) : d; },
     function (k, v) { store[k] = copy(v); send({ type: 'set', key: k, value: v }); },
     function (name, fn) { menu[name] = fn; send({ type: 'menu', name: name }); },
-    function () { throw new Error('Network requests are not available in strict-site mode.'); },
+    function (o) {
+      var id = nextId++; pending[id] = o;
+      send({ type: 'request', id: id, opts: { method: o.method, url: o.url, data: o.data, headers: o.headers, timeout: o.timeout } });
+    },
     { version: ${JSON.stringify(LOADER_VERSION)}, mode: 'page', openSettings: function () { send({ type: 'openSettings' }); } }
   );
 })();`;
@@ -221,6 +232,22 @@ ${code}
     setTimeout(() => {
       if (!document.documentElement.dataset.jobScreenerRunning) failed(new Error("Content Security Policy: the site refused the screener's script"));
     }, 1500);
+  }
+
+  // Strict-site mode: the screener asks the loader to make web requests for it. Only the
+  // team's Google Apps Script web app is allowed, so a page can't use this to reach anything else.
+  const RELAY_OK = /^https:\/\/script\.google\.com\/macros\/s\/[\w-]+\/exec(\?|$)/;
+  function relayRequest(m, toPage) {
+    const o = m.opts || {};
+    const reply = (r) => toPage({ type: 'response', id: m.id, ...r });
+    if (!RELAY_OK.test(String(o.url || ''))) return reply({ event: 'error' });
+    GM_xmlhttpRequest({
+      method: o.method === 'POST' ? 'POST' : 'GET', url: o.url, data: o.data, headers: o.headers,
+      timeout: Math.min(Number(o.timeout) || 20000, 30000), nocache: true,
+      onload: (r) => reply({ event: 'load', status: r.status, responseText: r.responseText }),
+      onerror: () => reply({ event: 'error' }),
+      ontimeout: () => reply({ event: 'timeout' }),
+    });
   }
 
   function failed(e) {
