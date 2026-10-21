@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Screener (Team)
 // @namespace    https://github.com/Akashlearntogit/job_screener_AM
-// @version      1.9.0
+// @version      1.10.0
 // @updateURL    https://raw.githubusercontent.com/Akashlearntogit/job_screener_loader/main/job-screener-loader.user.js
 // @downloadURL  https://raw.githubusercontent.com/Akashlearntogit/job_screener_loader/main/job-screener-loader.user.js
 // @description  Screens job postings for your chosen client. Downloads the latest screener and client profiles from the team's private GitHub repo automatically.
@@ -52,7 +52,7 @@
   // Keep @name, @namespace and @updateURL unchanged: Tampermonkey uses them to update this
   // script in place (keeping each person's key and client). After changing this file, run
   // scripts/publish-loader.sh so the public copy that Tampermonkey checks is updated too.
-  const LOADER_VERSION = '1.9';
+  const LOADER_VERSION = '1.10';
 
   const settings = () => GM_getValue(KEY.settings, {}) || {};
   // Decided from page content only (no site lists): structured JobPosting data, or text with
@@ -140,6 +140,19 @@
     };
   }
 
+  // ---------- used by the screener's panel (Settings tab and "Check for update") ----------
+  // Save name and key from the panel, then download the latest screener and client list.
+  // An empty key keeps the saved one, so someone can change only their name.
+  async function connectFromPanel(o) {
+    const memberName = String((o && o.memberName) || '').trim();
+    const token = String((o && o.token) || '').trim() || settings().token || '';
+    if (!token) return { ok: false, message: 'Paste the access key from your admin.' };
+    GM_setValue(KEY.settings, { ...settings(), memberName, token });
+    return checkForUpdate(true);
+  }
+  const checkFromPanel = () => checkForUpdate(true);
+  const PANEL_CALLS = { connect: connectFromPanel, checkForUpdate: checkFromPanel };
+
   // ---------- running the screener ----------
   let started = false;
   function run(code) {
@@ -163,18 +176,20 @@
       try { runInPage(code); return; } catch (e2) { return failed(e2); }
     }
     try {
-      fn(GM_addStyle, GM_getValue, GM_setValue, GM_registerMenuCommand, GM_xmlhttpRequest, { version: LOADER_VERSION, openSettings });
+      fn(GM_addStyle, GM_getValue, GM_setValue, GM_registerMenuCommand, GM_xmlhttpRequest, { version: LOADER_VERSION, openSettings, ...PANEL_CALLS });
     } catch (e) { failed(e); }
   }
 
   // ---------- strict-site mode: run the screener in the page, talk to it by messages ----------
-  // The screener only sees what it needs: the client profiles, the chosen client and the
-  // person's name. The GitHub access key never enters the page.
-  const PAGE_KEYS = [KEY.profiles, KEY.profilesAt, KEY.active];
+  // The screener only sees what it needs: the client profiles, the chosen client, its panel
+  // preferences and the person's name. The GitHub access key never enters the page (only
+  // whether one is saved).
+  const PAGE_SAVES = [KEY.active, 'js.theme', 'js.updateCheckedAt']; // what the page may change
+  const PAGE_KEYS = [KEY.profiles, KEY.profilesAt, ...PAGE_SAVES];
   function pageSnapshot() {
     const snap = {};
     for (const k of PAGE_KEYS) snap[k] = GM_getValue(k, null);
-    snap[KEY.settings] = { memberName: settings().memberName || '' };
+    snap[KEY.settings] = { memberName: settings().memberName || '', connected: !!settings().token };
     return snap;
   }
   function runInPage(code) {
@@ -183,10 +198,16 @@
     document.addEventListener(channel + '-out', (e) => {
       let m; try { m = JSON.parse(e.detail); } catch (_) { return; }
       if (m.type === 'style') GM_addStyle(String(m.css));
-      else if (m.type === 'set' && m.key === KEY.active) GM_setValue(KEY.active, String(m.value || ''));
+      else if (m.type === 'set' && PAGE_SAVES.includes(m.key)) GM_setValue(m.key, m.key === 'js.updateCheckedAt' ? Number(m.value) || 0 : String(m.value || ''));
       else if (m.type === 'menu') GM_registerMenuCommand(String(m.name), () => toPage({ type: 'menu', name: m.name }));
       else if (m.type === 'openSettings') openSettings();
       else if (m.type === 'request') relayRequest(m, toPage);
+      else if (m.type === 'call' && Object.prototype.hasOwnProperty.call(PANEL_CALLS, m.fn)) {
+        const arg = m.fn === 'connect' && m.arg ? { memberName: String(m.arg.memberName || ''), token: String(m.arg.token || '') } : undefined;
+        Promise.resolve(PANEL_CALLS[m.fn](arg))
+          .then((result) => toPage({ type: 'callResult', id: m.id, result: { ok: !!result.ok, changed: !!result.changed, message: String(result.message || '') } }))
+          .catch((e) => toPage({ type: 'callResult', id: m.id, result: { ok: false, message: String(e && e.message || e) } }));
+      }
     });
     // Keep the page's copy current when the client or profiles change in this browser.
     let last = JSON.stringify(pageSnapshot());
@@ -209,7 +230,12 @@
       else if (m.event === 'timeout' && o.ontimeout) o.ontimeout();
       else if (o.onerror) o.onerror();
     }
+    if (m.type === 'callResult' && calls[m.id]) { var done = calls[m.id]; delete calls[m.id]; done(m.result); }
   });
+  var calls = {}, nextCall = 1;
+  function callLoader(fn, arg) {
+    return new Promise(function (resolve) { var id = nextCall++; calls[id] = resolve; send({ type: 'call', id: id, fn: fn, arg: arg }); });
+  }
   var pending = {}, nextId = 1;
   var copy = function (v) { return v == null ? v : JSON.parse(JSON.stringify(v)); };
   (function (GM_addStyle, GM_getValue, GM_setValue, GM_registerMenuCommand, GM_xmlhttpRequest, LOADER_INFO) {
@@ -223,7 +249,8 @@ ${code}
       var id = nextId++; pending[id] = o;
       send({ type: 'request', id: id, opts: { method: o.method, url: o.url, data: o.data, headers: o.headers, timeout: o.timeout } });
     },
-    { version: ${JSON.stringify(LOADER_VERSION)}, mode: 'page', openSettings: function () { send({ type: 'openSettings' }); } }
+    { version: ${JSON.stringify(LOADER_VERSION)}, mode: 'page', openSettings: function () { send({ type: 'openSettings' }); },
+      connect: function (o) { return callLoader('connect', o); }, checkForUpdate: function () { return callLoader('checkForUpdate'); } }
   );
 })();`;
     if (typeof GM_addElement !== 'function') throw new Error('GM_addElement is not available');
@@ -311,7 +338,7 @@ ${code}
     box.innerHTML = `
       <h3>Job Screener setup <small style="opacity:.6;font-weight:400">loader v${LOADER_VERSION}</small></h3>
       <div class="jsl-status" ${connected ? '' : 'hidden'}>
-        <p>✓ Connected<span class="jsl-who"></span>. Pick the client on the job banner.</p>
+        <p>✓ Connected<span class="jsl-who"></span>. Pick the client in the banner's Settings tab.</p>
         <button type="button" data-a="creds">Change name / access key</button>
       </div>
       <div class="jsl-creds" ${connected ? 'hidden' : ''}>
@@ -386,7 +413,7 @@ ${code}
       const routine = r.message === 'Up to date.' || r.message.startsWith('New version');
       if (!routine) { msg.textContent = r.message; return; }
       msg.textContent = !activeClients().length ? '✓ Connected, but there are no clients in profiles.json yet.'
-        : GM_getValue(KEY.active, '') ? '✓ Connected. You can change the client above or on the job banner.'
+        : GM_getValue(KEY.active, '') ? '✓ Connected. You can change the client above or in the banner\'s Settings tab.'
         : '✓ Connected. Now pick a client above.';
     };
     box.querySelector('[data-a="update"]').onclick = async () => {
