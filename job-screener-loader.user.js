@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Screener (Team)
 // @namespace    https://github.com/Akashlearntogit/job_screener_AM
-// @version      1.8.0
+// @version      1.9.0
 // @updateURL    https://raw.githubusercontent.com/Akashlearntogit/job_screener_loader/main/job-screener-loader.user.js
 // @downloadURL  https://raw.githubusercontent.com/Akashlearntogit/job_screener_loader/main/job-screener-loader.user.js
 // @description  Screens job postings for your chosen client. Downloads the latest screener and client profiles from the team's private GitHub repo automatically.
@@ -52,7 +52,7 @@
   // Keep @name, @namespace and @updateURL unchanged: Tampermonkey uses them to update this
   // script in place (keeping each person's key and client). After changing this file, run
   // scripts/publish-loader.sh so the public copy that Tampermonkey checks is updated too.
-  const LOADER_VERSION = '1.8';
+  const LOADER_VERSION = '1.9';
 
   const settings = () => GM_getValue(KEY.settings, {}) || {};
   // Decided from page content only (no site lists): structured JobPosting data, or text with
@@ -277,7 +277,7 @@ ${code}
     #jsl-box button { padding: 6px 12px; border-radius: 6px; border: 0; font: 600 12px system-ui, sans-serif; cursor: pointer; background: #e2e8f0; color: #0f172a; }
     #jsl-box button.jsl-primary { background: #22c55e; color: #052e16; }
     #jsl-box .jsl-client { margin-top: 10px; padding-top: 10px; border-top: 1px solid #334155; }
-    #jsl-box .jsl-client[hidden] { display: none; }
+    #jsl-box [hidden] { display: none !important; }
     #jsl-box .jsl-msg { margin-top: 10px; font-size: 12px; min-height: 1em; }
     #jsl-box.jsl-pill { width: auto; padding: 8px 12px; cursor: pointer; }
   `);
@@ -307,15 +307,22 @@ ${code}
     const s = settings();
     const box = document.createElement('div');
     box.id = 'jsl-box';
+    const connected = !!s.token;
     box.innerHTML = `
       <h3>Job Screener setup <small style="opacity:.6;font-weight:400">loader v${LOADER_VERSION}</small></h3>
-      <p>Your admin gives you the access key. You only do this once.</p>
-      <label for="jsl-name">Your name</label>
-      <input id="jsl-name" autocomplete="off" placeholder="e.g. Priya">
-      <label for="jsl-token">GitHub access key</label>
-      <input id="jsl-token" type="password" autocomplete="off" placeholder="github_pat_…">
+      <div class="jsl-status" ${connected ? '' : 'hidden'}>
+        <p>✓ Connected<span class="jsl-who"></span>. Pick the client on the job banner.</p>
+        <button type="button" data-a="creds">Change name / access key</button>
+      </div>
+      <div class="jsl-creds" ${connected ? 'hidden' : ''}>
+        <p>Your admin gives you the access key. You only do this once.</p>
+        <label for="jsl-name">Your name</label>
+        <input id="jsl-name" autocomplete="off" placeholder="e.g. Priya">
+        <label for="jsl-token">GitHub access key</label>
+        <input id="jsl-token" type="password" autocomplete="off" placeholder="github_pat_…">
+      </div>
       <div class="jsl-row">
-        <button type="button" class="jsl-primary" data-a="connect">Connect</button>
+        <button type="button" class="jsl-primary" data-a="connect" ${connected ? 'hidden' : ''}>Connect</button>
         <button type="button" data-a="update">Check for update</button>
         <button type="button" data-a="close">Close</button>
       </div>
@@ -332,6 +339,14 @@ ${code}
     const msg = box.querySelector('.jsl-msg');
     name.value = s.memberName || '';
     token.value = s.token || '';
+    box.querySelector('.jsl-who').textContent = s.memberName ? ' as ' + s.memberName : '';
+    // Already connected: name and key stay tucked away until asked for.
+    box.querySelector('[data-a="creds"]').onclick = () => {
+      box.querySelector('.jsl-status').hidden = true;
+      box.querySelector('.jsl-creds').hidden = false;
+      box.querySelector('[data-a="connect"]').hidden = false;
+      name.focus();
+    };
 
     function fillClients() {
       const list = activeClients();
@@ -348,8 +363,9 @@ ${code}
         select.append(o);
       }
       select.value = list.some((p) => clientId(p) === current) ? current : '';
-      clientWrap.hidden = !settings().token;
+      clientWrap.hidden = !justConnected;
     }
+    let justConnected = false;
     fillClients();
 
     select.onchange = () => {
@@ -364,12 +380,13 @@ ${code}
       msg.textContent = 'Connecting to GitHub…';
       GM_setValue(KEY.settings, { ...settings(), memberName: name.value.trim(), token: t });
       const r = await checkForUpdate(true);
+      justConnected = r.ok;
       fillClients();
       if (!r.ok) { msg.textContent = r.message; return; }
       const routine = r.message === 'Up to date.' || r.message.startsWith('New version');
       if (!routine) { msg.textContent = r.message; return; }
       msg.textContent = !activeClients().length ? '✓ Connected, but there are no clients in profiles.json yet.'
-        : GM_getValue(KEY.active, '') ? '✓ Connected. You can change the client above.'
+        : GM_getValue(KEY.active, '') ? '✓ Connected. You can change the client above or on the job banner.'
         : '✓ Connected. Now pick a client above.';
     };
     box.querySelector('[data-a="update"]').onclick = async () => {
@@ -380,7 +397,7 @@ ${code}
     };
   }
 
-  GM_registerMenuCommand('Job Screener: settings / change client', openSettings);
+  GM_registerMenuCommand('Job Screener: settings (name / access key)', openSettings);
   GM_registerMenuCommand('Job Screener: check for update now', async () => {
     const r = await checkForUpdate(true);
     notice(r.message, !r.ok);
